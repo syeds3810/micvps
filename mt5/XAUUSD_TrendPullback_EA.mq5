@@ -6,16 +6,19 @@
 //|   1. Higher-TF trend filter : EMA(200) on H1 + price side        |
 //|   2. Entry TF pullback      : price pulls back to EMA(50) zone   |
 //|   3. Momentum confirm       : RSI crosses back in trend direction|
-//|   4. Risk                   : ATR based SL, TP = SL * RR         |
-//|   5. Management             : break-even + ATR trailing stop     |
+//|   4. Risk                   : ATR based SL, % risk position size |
+//|   5. Exit                   : partial close at TP1 (1R) + SL to  |
+//|                               BE, runner to TP2 (2.5R) w/ trail  |
+//|                               -> high win rate AND positive      |
+//|                                  expectancy                      |
 //|   6. Filters                : session, spread, max trades/day,   |
-//|                               daily loss limit                   |
+//|                               daily loss, monthly target/DD stop |
 //|                                                                  |
 //|  NOTE: No EA can guarantee a win rate. Backtest + forward test   |
 //|  on demo before going live.                                      |
 //+------------------------------------------------------------------+
 #property copyright "micvps"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -28,13 +31,14 @@ input ENUM_TIMEFRAMES InpTrendTF          = PERIOD_H1;     // Trend timeframe
 
 //--- Inputs: risk
 input group "=== Risk ==="
-input double          InpRiskPercent      = 1.0;           // Risk % per trade (0 = fixed lot)
+input double          InpRiskPercent      = 1.5;           // Risk % per trade (0 = fixed lot)
 input double          InpFixedLot         = 0.01;          // Fixed lot (if risk % = 0)
 input double          InpSL_ATR_Mult      = 1.5;           // Stop loss = ATR * mult
-input double          InpRR               = 1.0;           // Take profit = SL * RR (lower RR -> higher win rate)
 input int             InpMaxSpreadPoints  = 350;           // Max spread (points)
 input int             InpMaxTradesPerDay  = 3;             // Max trades per day
-input double          InpMaxDailyLossPct  = 3.0;           // Stop trading after daily loss % (0 = off)
+input double          InpMaxDailyLossPct  = 4.0;           // Stop trading after daily loss % (0 = off)
+input double          InpMonthlyTargetPct = 20.0;          // Stop new trades after monthly profit % (0 = off)
+input double          InpMaxMonthlyDDPct  = 12.0;          // Stop new trades after monthly loss % (0 = off)
 
 //--- Inputs: indicators
 input group "=== Indicators ==="
@@ -50,12 +54,12 @@ input double          InpMinADX           = 20.0;          // Min ADX (trend str
 
 //--- Inputs: trade management
 input group "=== Trade Management ==="
-input bool            InpUseBreakEven     = true;          // Use break-even
-input double          InpBE_TriggerR      = 0.6;           // Move SL to BE at this R multiple
-input double          InpBE_LockPoints    = 50;            // Points locked in at BE
-input bool            InpUseTrailing      = true;          // Use ATR trailing
-input double          InpTrail_StartR     = 0.8;           // Start trailing at this R multiple
-input double          InpTrail_ATR_Mult   = 1.0;           // Trailing distance = ATR * mult
+input double          InpTP1_R            = 1.0;           // TP1 at this R multiple (partial close + BE)
+input double          InpPartialPct       = 50.0;          // % of position closed at TP1
+input double          InpTP2_R            = 2.5;           // Final TP (runner) at this R multiple
+input double          InpBE_LockPoints    = 50;            // Points locked in when SL moves to BE
+input bool            InpUseTrailing      = true;          // Trail the runner after TP1
+input double          InpTrail_ATR_Mult   = 1.2;           // Trailing distance = ATR * mult
 
 //--- Inputs: session (server time)
 input group "=== Session (server time) ==="
@@ -130,6 +134,7 @@ void OnTick()
    if(!SpreadOK())                     return;
    if(TradesToday() >= InpMaxTradesPerDay) return;
    if(DailyLossHit())                  return;
+   if(MonthlyLimitHit())               return;
 
    int signal = GetSignal();
    if(signal != 0)
@@ -199,7 +204,7 @@ void OpenTrade(int dir)
    if(CopyBuffer(hATR, 0, 1, 1, atr) < 1) return;
 
    double slDist = atr[0] * InpSL_ATR_Mult;
-   double tpDist = slDist * InpRR;
+   double tpDist = slDist * InpTP2_R;
 
    // respect broker min stop level
    double minStop = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
@@ -255,17 +260,19 @@ double CalcLot(double slDist)
 }
 
 //+------------------------------------------------------------------+
-//| Break-even + ATR trailing                                        |
+//| TP1: partial close + SL to break-even, then ATR trail the runner |
+//| Initial risk R is derived from the untouched final TP:           |
+//|   R = |TP - open| / InpTP2_R                                     |
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
-   if(!InpUseBreakEven && !InpUseTrailing) return;
-
    double atr[];
    ArraySetAsSeries(atr, true);
    if(CopyBuffer(hATR, 0, 1, 1, atr) < 1) return;
 
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   int    digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -274,52 +281,45 @@ void ManagePositions()
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagic) continue;
 
-      long   type  = PositionGetInteger(POSITION_TYPE);
-      double open  = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl    = PositionGetDouble(POSITION_SL);
-      double tp    = PositionGetDouble(POSITION_TP);
-      double risk  = atr[0] * InpSL_ATR_Mult;   // approx initial R
+      long   type   = PositionGetInteger(POSITION_TYPE);
+      double open   = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl     = PositionGetDouble(POSITION_SL);
+      double tp     = PositionGetDouble(POSITION_TP);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      if(tp <= 0 || InpTP2_R <= 0) continue;
+
+      double risk = MathAbs(tp - open) / InpTP2_R;
       if(risk <= 0) continue;
 
-      double newSL = sl;
+      bool   isBuy  = (type == POSITION_TYPE_BUY);
+      double price  = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double profit = isBuy ? price - open : open - price;
+      double be     = isBuy ? open + InpBE_LockPoints * _Point : open - InpBE_LockPoints * _Point;
 
-      if(type == POSITION_TYPE_BUY)
+      // TP1 is "done" once SL sits at/beyond break-even
+      bool tp1Done = isBuy ? (sl > 0 && sl >= open) : (sl > 0 && sl <= open);
+
+      if(!tp1Done && profit >= risk * InpTP1_R)
       {
-         double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double profit = bid - open;
-
-         if(InpUseBreakEven && profit >= risk * InpBE_TriggerR)
+         double closeVol = MathFloor(volume * InpPartialPct / 100.0 / stepLot) * stepLot;
+         if(closeVol >= minLot && volume - closeVol >= minLot)
          {
-            double be = open + InpBE_LockPoints * _Point;
-            if(newSL < be) newSL = be;
+            if(!trade.PositionClosePartial(ticket, NormalizeDouble(closeVol, 2)))
+               Print("Partial close failed: ", trade.ResultRetcodeDescription());
          }
-         if(InpUseTrailing && profit >= risk * InpTrail_StartR)
-         {
-            double trail = bid - atr[0] * InpTrail_ATR_Mult;
-            if(trail > newSL) newSL = trail;
-         }
-         newSL = NormalizeDouble(newSL, digits);
-         if(newSL > sl + _Point && newSL < bid)
-            trade.PositionModify(ticket, newSL, tp);
+         if(PositionSelectByTicket(ticket))
+            trade.PositionModify(ticket, NormalizeDouble(be, digits), tp);
+         continue;
       }
-      else if(type == POSITION_TYPE_SELL)
-      {
-         double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         double profit = open - ask;
 
-         if(InpUseBreakEven && profit >= risk * InpBE_TriggerR)
-         {
-            double be = open - InpBE_LockPoints * _Point;
-            if(newSL == 0 || newSL > be) newSL = be;
-         }
-         if(InpUseTrailing && profit >= risk * InpTrail_StartR)
-         {
-            double trail = ask + atr[0] * InpTrail_ATR_Mult;
-            if(newSL == 0 || trail < newSL) newSL = trail;
-         }
-         newSL = NormalizeDouble(newSL, digits);
-         if((sl == 0 || newSL < sl - _Point) && newSL > ask)
-            trade.PositionModify(ticket, newSL, tp);
+      if(tp1Done && InpUseTrailing)
+      {
+         double trail = isBuy ? price - atr[0] * InpTrail_ATR_Mult : price + atr[0] * InpTrail_ATR_Mult;
+         trail = NormalizeDouble(trail, digits);
+         if(isBuy && trail > sl + _Point && trail < price)
+            trade.PositionModify(ticket, trail, tp);
+         else if(!isBuy && trail < sl - _Point && trail > price)
+            trade.PositionModify(ticket, trail, tp);
       }
    }
 }
@@ -394,6 +394,36 @@ bool DailyLossHit()
    }
    double limit = AccountInfoDouble(ACCOUNT_BALANCE) * InpMaxDailyLossPct / 100.0;
    return pnl <= -limit;
+}
+
+//+------------------------------------------------------------------+
+//| Monthly target / drawdown guard (closed P&L of this EA)          |
+//+------------------------------------------------------------------+
+bool MonthlyLimitHit()
+{
+   if(InpMonthlyTargetPct <= 0 && InpMaxMonthlyDDPct <= 0) return false;
+
+   MqlDateTime t;
+   TimeToStruct(TimeCurrent(), t);
+   t.day = 1; t.hour = 0; t.min = 0; t.sec = 0;
+   if(!HistorySelect(StructToTime(t), TimeCurrent())) return false;
+
+   double pnl = 0;
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != (long)InpMagic) continue;
+      pnl += HistoryDealGetDouble(d, DEAL_PROFIT)
+           + HistoryDealGetDouble(d, DEAL_SWAP)
+           + HistoryDealGetDouble(d, DEAL_COMMISSION);
+   }
+   double startBal = AccountInfoDouble(ACCOUNT_BALANCE) - pnl;
+   if(startBal <= 0) return true;
+
+   double pct = pnl / startBal * 100.0;
+   if(InpMonthlyTargetPct > 0 && pct >= InpMonthlyTargetPct)  return true;
+   if(InpMaxMonthlyDDPct  > 0 && pct <= -InpMaxMonthlyDDPct)  return true;
+   return false;
 }
 
 //+------------------------------------------------------------------+
